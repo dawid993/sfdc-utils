@@ -13,6 +13,9 @@ records_filename='records_access.txt'
 
 soql_query="SELECT+count()+FROM+"
 
+# Global variables
+declare -a objects
+
 exit_with_msg() {
     echo "$1"
     exit 1
@@ -80,6 +83,17 @@ request_query_endpoint() {
     fi
 }
 
+# Passing extra flags to program:
+# o - specifies which object should be checked
+process_flags() {
+    while getopts ":o:" opt; do
+        case "$opt" in
+            o) IFS="," read -r -a objects <<< "$OPTARG" ;;
+            \?) echo "Invalid option: -$OPTARG" ;;
+        esac
+    done
+}
+
 enumerate_accessible_sobjects() {
     sfdc_response=$(request_sfdc "$sobject_endpoint" "$ADMIN_TOKEN")
     http_status=$(get_resp_status "$sfdc_response")
@@ -121,8 +135,10 @@ check_record_access() {
         exit_with_msg "$objects_filename not found"
     fi
 
-    echo '[' >> $records_filename
+    count=0
 
+    echo '[' >> $records_filename
+    
     for row in $(cat $objects_filename | jq -r '.[] | .name'); do
         request_endpoint="$query_endpoint$soql_query$row"
 
@@ -136,28 +152,45 @@ check_record_access() {
         admin_resp=$(echo "$admin_resp" | jq '.totalSize')
         user_resp=$(request_query_endpoint "$TOKEN" "$request_endpoint" | jq '.totalSize')
 
-        is_diff_found=0
-
-        if (( admin_resp != user_resp)); then
-            is_diff_found=1
-            printf '{\n"sObject": "%s",\n "admin": %s,\n"user": %s\r},\n' "$row" "$admin_resp" "$user_resp" >> "$records_filename"
+        format='{"sObject":"%s","admin":%s,"user":%s}'
+        if (( count > 0)); then
+            format=",$format"
         fi
 
-        if ((is_diff_found == 1)); then
-            echo "Found differences in record count"
-        fi
+        printf "$format" "$row" "$admin_resp" "$user_resp" >> "$records_filename"
+
+        (( count++ ))
     done
 
     echo ']' >> $records_filename
+
+    jq . "$records_filename" > temp_file && mv temp_file "$records_filename"
 }
 
-is_env_ready
+subset_objects() {
+    objects_as_json=$(printf "%s\n" ${objects[@]} | jq -R . | jq -s . | jq -c .)
+    jq --argjson sel_objs "$objects_as_json" 'map(select(.name as $obj | $sel_objs | index ($obj)))' < "$objects_filename" > temp_file && 
+        mv temp_file "$objects_filename"
+}
 
-echo "Removing files from previous run -- you have 10 seconds to cancel action"
+run() {
+    is_env_ready
 
-sleep 2
+    echo "Removing files from previous run -- you have 10 seconds to cancel action"
 
-rm $objects_filename $records_filename 2> /dev/null
+    sleep 2
+    
+    rm $objects_filename $records_filename 2> /dev/null
 
-enumerate_accessible_sobjects
-check_record_access
+    enumerate_accessible_sobjects
+
+    if (( ${#objects} > 0 )); then
+        echo "Objects passed: ${objects}. Checking only for them"
+        subset_objects
+    fi
+
+    check_record_access
+}
+
+process_flags "$@"
+run "$@"
